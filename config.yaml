@@ -1,21 +1,25 @@
-- fullurl: http://example.com/health
-  status: 200
-  headers:
-    Content-Type: application/json
-  content: '{"status":"ok"}'
+fullUrl:
+  http://example.com/health:
+    status: 200
+    headers:
+      Content-Type: application/json
+    content: '{"status":"ok"}'
 
-- path: /robots.txt
-  status: 200
-  headers:
-    Content-Type: text/plain
-  content: "Disallow: *"
+host:
+  example.com:
+    status: 302
+    headers:
+      Location: https://www.example.com
 
-- host: example.com
-  status: 302
-  headers:
-    Location: https://www.example.com
+path:
+  /robots.txt:
+    status: 200
+    headers:
+      Content-Type: text/plain
+    content: "Disallow: *"
 
-- statusCode: 404
+default:
+  status: 404
   headers:
     Content-Type: text/plain
   content: "Not Found"

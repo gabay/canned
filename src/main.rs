@@ -4,6 +4,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
+use std::process;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -17,26 +18,21 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use tokio::net::TcpListener;
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawConfig {
-    List(Vec<RawRule>),
-    Object {
-        #[serde(default)]
-        rules: Vec<RawRule>,
-        #[serde(default)]
-        default: Option<RawRule>,
-    },
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    #[serde(default, alias = "fullurl", alias = "full_url")]
+    #[serde(rename = "fullUrl")]
+    full_url: HashMap<String, ResponseRule>,
+    #[serde(default, alias = "hosts", alias = "domain", alias = "domains")]
+    host: HashMap<String, ResponseRule>,
+    #[serde(default, alias = "paths", alias = "uri", alias = "uris")]
+    path: HashMap<String, ResponseRule>,
+    #[serde(default, alias = "fallback")]
+    default: Option<ResponseRule>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawRule {
-    #[serde(alias = "full_url", alias = "fullUrl", alias = "url")]
-    fullurl: Option<String>,
-    #[serde(alias = "hostname", alias = "domain")]
-    host: Option<String>,
-    #[serde(alias = "uri")]
-    path: Option<String>,
+#[derive(Debug, Deserialize, Clone)]
+struct ResponseRule {
     #[serde(alias = "statusCode", alias = "status_code")]
     status: Option<u16>,
     #[serde(default)]
@@ -122,7 +118,7 @@ pub struct CannedResponse {
 }
 
 impl CannedResponse {
-    fn from_raw(rule: &RawRule) -> Result<Self, String> {
+    fn from_rule(rule: &ResponseRule) -> Result<Self, String> {
         let status_code = rule.status.unwrap_or(200);
         let status = StatusCode::from_u16(status_code)
             .map_err(|e| format!("invalid status code {status_code}: {e}"))?;
@@ -163,51 +159,42 @@ pub struct Router {
 
 impl Router {
     pub fn from_yaml(yaml: &str) -> Result<Self, String> {
-        let raw: RawConfig =
+        let config: Config =
             serde_yaml::from_str(yaml).map_err(|e| format!("failed to parse YAML config: {e}"))?;
-
-        let (rules, explicit_default) = match raw {
-            RawConfig::List(rules) => (rules, None),
-            RawConfig::Object { rules, default } => (rules, default),
-        };
 
         let mut full_urls = HashMap::new();
         let mut hosts = HashMap::new();
         let mut paths = HashMap::new();
-        let mut default_response: Option<CannedResponse> = None;
 
-        if let Some(def) = explicit_default {
-            default_response = Some(CannedResponse::from_raw(&def)?);
-        }
-
-        for rule in &rules {
-            let response = CannedResponse::from_raw(rule)?;
-
-            if let Some(raw_url) = &rule.fullurl {
-                let (with_scheme, without_scheme) = normalize_full_url(raw_url);
-                if let Some(ws) = with_scheme {
-                    full_urls.entry(ws).or_insert_with(|| response.clone());
-                }
-                full_urls.entry(without_scheme).or_insert(response);
-            } else if let (Some(h), Some(p)) = (&rule.host, &rule.path) {
-                let combined = format!("{}{}", normalize_host(h), normalize_path(p));
-                full_urls.entry(combined).or_insert(response);
-            } else if let Some(h) = &rule.host {
-                let norm_host = normalize_host(h);
-                hosts.entry(norm_host).or_insert(response);
-            } else if let Some(p) = &rule.path {
-                let norm_path = normalize_path(p);
-                paths.entry(norm_path).or_insert(response);
-            } else if default_response.is_none() {
-                default_response = Some(response);
+        for (url, rule) in &config.full_url {
+            let response = CannedResponse::from_rule(rule)?;
+            let (with_scheme, without_scheme) = normalize_full_url(url);
+            if let Some(ws) = with_scheme {
+                full_urls.entry(ws).or_insert_with(|| response.clone());
             }
+            full_urls.entry(without_scheme).or_insert(response);
         }
 
-        let default_response = default_response.unwrap_or_else(|| CannedResponse {
-            status: StatusCode::NOT_FOUND,
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        });
+        for (host, rule) in &config.host {
+            let response = CannedResponse::from_rule(rule)?;
+            let norm_host = normalize_host(host);
+            hosts.entry(norm_host).or_insert(response);
+        }
+
+        for (path, rule) in &config.path {
+            let response = CannedResponse::from_rule(rule)?;
+            let norm_path = normalize_path(path);
+            paths.entry(norm_path).or_insert(response);
+        }
+
+        let default_response = match &config.default {
+            Some(rule) => CannedResponse::from_rule(rule)?,
+            None => CannedResponse {
+                status: StatusCode::NOT_FOUND,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        };
 
         Ok(Self {
             full_urls,
@@ -232,39 +219,34 @@ impl Router {
 
         // 1. Check fullurl (first matching fullurl wins)
         if !self.full_urls.is_empty() {
-            if let Some(ref h) = host_lower {
-                if let Some(resp) = self.lookup_full_url(scheme, h, path, path_and_query) {
+            if let Some(ref h) = host_lower
+                && let Some(resp) = self.lookup_full_url(scheme, h, path, path_and_query) {
                     return resp;
                 }
-            }
-            if let Some(ref h_np) = host_no_port {
-                if let Some(resp) = self.lookup_full_url(scheme, h_np, path, path_and_query) {
+            if let Some(ref h_np) = host_no_port
+                && let Some(resp) = self.lookup_full_url(scheme, h_np, path, path_and_query) {
                     return resp;
                 }
-            }
         }
 
         // 2. Check host
         if !self.hosts.is_empty() {
-            if let Some(ref h) = host_lower {
-                if let Some(resp) = self.hosts.get(h.as_str()) {
+            if let Some(ref h) = host_lower
+                && let Some(resp) = self.hosts.get(h.as_str()) {
                     return resp;
                 }
-            }
-            if let Some(ref h_np) = host_no_port {
-                if let Some(resp) = self.hosts.get(h_np.as_str()) {
+            if let Some(ref h_np) = host_no_port
+                && let Some(resp) = self.hosts.get(h_np.as_str()) {
                     return resp;
                 }
-            }
         }
 
         // 3. Check path
         if !self.paths.is_empty() {
-            if path_and_query != path {
-                if let Some(resp) = self.paths.get(path_and_query) {
+            if path_and_query != path
+                && let Some(resp) = self.paths.get(path_and_query) {
                     return resp;
                 }
-            }
             if let Some(resp) = self.paths.get(path) {
                 return resp;
             }
@@ -397,31 +379,43 @@ fn handle_request(req: Request<Incoming>, router: &Router) -> Response<Full<Byte
 
 fn get_config_path() -> String {
     for var in ["CONFIG", "CANNED_CONFIG"] {
-        if let Ok(val) = env::var(var) {
-            if !val.trim().is_empty() {
+        if let Ok(val) = env::var(var)
+            && !val.trim().is_empty() {
                 return val;
             }
-        }
     }
     if let Some(arg) = env::args().nth(1) {
         return arg;
     }
-    "/config.yaml".to_string()
+    "/canned.yaml".to_string()
 }
 
 fn get_port() -> u16 {
     for var in ["PORT", "CANNED_PORT"] {
-        if let Ok(val) = env::var(var) {
-            if let Ok(port) = val.trim().parse::<u16>() {
+        if let Ok(val) = env::var(var)
+            && let Ok(port) = val.trim().parse::<u16>() {
                 return port;
             }
-        }
     }
     7890
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("canned error: failed to initialize tokio runtime: {err}");
+            process::exit(1);
+        }
+    };
+
+    if let Err(err) = rt.block_on(run_server()) {
+        eprintln!("canned error: {err}");
+        process::exit(1);
+    }
+}
+
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = get_config_path();
     let yaml_content = fs::read_to_string(&config_path)
         .map_err(|e| format!("failed to read config file at '{config_path}': {e}"))?;
@@ -456,11 +450,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(err) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
                         .await
-                    {
-                        if !err.is_incomplete_message() {
+                        && !err.is_incomplete_message() {
                             eprintln!("connection error: {err}");
                         }
-                    }
                 });
             }
             _ = shutdown_signal() => {
@@ -503,21 +495,25 @@ mod tests {
     use super::*;
 
     const EXAMPLE_YAML: &str = r#"
-- path: /robots.txt
-  status: 200
-  headers:
-    Content-Type: text/plain
-  content: "Disallow: *"
-- host: example.com
-  status: 302
-  headers:
-    Location: https://www.example.com
-- fullurl: http://example.com/override
-  status: 201
-  headers:
-    X-Custom: "yes"
-  content: "Full URL matched"
-- statusCode: 404
+fullUrl:
+  http://example.com/override:
+    status: 201
+    headers:
+      X-Custom: "yes"
+    content: "Full URL matched"
+host:
+  example.com:
+    status: 302
+    headers:
+      Location: https://www.example.com
+path:
+  /robots.txt:
+    status: 200
+    headers:
+      Content-Type: text/plain
+    content: "Disallow: *"
+default:
+  status: 404
   content: "Not Found"
 "#;
 
@@ -531,7 +527,7 @@ mod tests {
         assert_eq!(resp.headers.get("x-custom").unwrap(), "yes");
         assert_eq!(resp.body, Bytes::from("Full URL matched"));
 
-        // 2. Matching host beats matching path (/robots.txt is earlier in YAML, but host has higher priority than path)
+        // 2. Matching host beats matching path (/robots.txt matches both host and path)
         let resp = router.resolve("http", Some("example.com"), "/robots.txt", "/robots.txt");
         assert_eq!(resp.status, StatusCode::FOUND);
         assert_eq!(
@@ -561,56 +557,24 @@ mod tests {
     }
 
     #[test]
-    fn test_first_matching_rule_wins_within_same_tier() {
-        let yaml = r#"
-- path: /dup
-  status: 200
-  content: "first"
-- path: /dup
-  status: 200
-  content: "second"
-- host: dup.com
-  status: 200
-  content: "first-host"
-- host: dup.com
-  status: 200
-  content: "second-host"
-- statusCode: 418
-  content: "first-default"
-- statusCode: 500
-  content: "second-default"
-"#;
-        let router = Router::from_yaml(yaml).expect("valid yaml");
-
-        let resp = router.resolve("http", Some("any.com"), "/dup", "/dup");
-        assert_eq!(resp.body, Bytes::from("first"));
-
-        let resp = router.resolve("http", Some("dup.com"), "/other", "/other");
-        assert_eq!(resp.body, Bytes::from("first-host"));
-
-        let resp = router.resolve("http", Some("any.com"), "/other", "/other");
-        assert_eq!(resp.status, StatusCode::IM_A_TEAPOT);
-        assert_eq!(resp.body, Bytes::from("first-default"));
-    }
-
-    #[test]
     fn test_various_header_and_url_formats() {
         let yaml = r#"
-- fullurl: example.com/dict-headers
-  status: 200
-  headers:
-    X-Single: "value1"
-    X-Number: 42
-    X-List:
-      - "valA"
-      - "valB"
-  content: "dict-ok"
-- host: sub.example.com
-  path: /combined
-  status: 202
-  headers:
-    Content-Type: application/json
-  content: '{"ok":true}'
+fullUrl:
+  example.com/dict-headers:
+    status: 200
+    headers:
+      X-Single: "value1"
+      X-Number: 42
+      X-List:
+        - "valA"
+        - "valB"
+    content: "dict-ok"
+path:
+  /combined:
+    status: 202
+    headers:
+      Content-Type: application/json
+    content: '{"ok":true}'
 "#;
         let router = Router::from_yaml(yaml).expect("valid yaml");
 
@@ -629,13 +593,26 @@ mod tests {
     #[test]
     fn test_rejects_header_list() {
         let yaml = r#"
-- path: /invalid
-  status: 200
-  headers:
-    - Content-Type: text/plain
-  content: "bad"
+path:
+  /invalid:
+    status: 200
+    headers:
+      - Content-Type: text/plain
+    content: "bad"
 "#;
         let res = Router::from_yaml(yaml);
         assert!(res.is_err(), "should reject list of headers");
+    }
+
+    #[test]
+    fn test_rejects_old_list_format() {
+        let yaml = r#"
+- path: /robots.txt
+  status: 200
+  content: "Disallow: *"
+- statusCode: 404
+"#;
+        let res = Router::from_yaml(yaml);
+        assert!(res.is_err(), "should reject old list format");
     }
 }

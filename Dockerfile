@@ -7,11 +7,14 @@ WORKDIR /app
 
 # Cache dependencies first
 COPY Cargo.toml ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
 
 # Build the actual binary
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release
 
 FROM scratch
 
