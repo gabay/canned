@@ -20,6 +20,6 @@ FROM scratch
 
 COPY --from=builder /app/target/release/canned /canned
 
+ENV CANNED_CONFIG=/etc/canned/canned.yaml
 EXPOSE 7890
-
 ENTRYPOINT ["/canned"]

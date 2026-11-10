@@ -10,7 +10,7 @@ A minimal, high-performance static HTTP mock/stub server written in Rust, config
 - **Configurable responses**: Custom HTTP status code, headers (as a dictionary/map), and static body content.
 - **Minimal Docker image**: Multi-stage build producing a completely static binary running on `FROM scratch`.
 - **Configurable via environment variables**:
-  - `CONFIG` (or `CANNED_CONFIG`): path to the YAML file (defaults to `/canned.yaml`).
+  - `CONFIG` (or `CANNED_CONFIG`): path to the YAML file (defaults to `canned.yaml`).
   - `PORT` (or `CANNED_PORT`): port to listen on (defaults to `7890`).
 
 ---

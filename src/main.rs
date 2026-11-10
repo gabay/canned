@@ -387,7 +387,7 @@ fn get_config_path() -> String {
     if let Some(arg) = env::args().nth(1) {
         return arg;
     }
-    "/canned.yaml".to_string()
+    "canned.yaml".to_string()
 }
 
 fn get_port() -> u16 {
